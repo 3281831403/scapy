@@ -56,7 +56,7 @@ from scapy.ansmachine import AnsweringMachine
 from scapy.plist import PacketList
 from scapy.layers.l2 import Ether, LLC, MACField
 from scapy.layers.inet import IP, TCP
-from scapy.error import warning, log_loading
+from scapy.error import log_loading, log_runtime, warning
 from scapy.sendrecv import sniff, sendp
 
 
@@ -890,8 +890,8 @@ class _Dot11EltUtils(Packet):
             # see https://github.com/secdev/scapy/issues/2683
             if p.ID == 0 and "ssid" not in summary:
                 summary["ssid"] = plain_str(p.info)
-            elif p.ID == 3:
-                summary["channel"] = ord(p.info)
+            elif p.ID == 3 and p.info:
+                summary["channel"] = ord(p.info[:1])
             elif isinstance(p, Dot11EltCountry):
                 summary["country"] = plain_str(p.country_string[:2])
                 country_descriptor_types = {
@@ -1077,6 +1077,15 @@ class Dot11Elt(Packet):
         return cls
 
     def pre_dissect(self, s):
+        # An information element is delimited by its own length: only
+        # dissect the bytes it announces, and leave the remaining ones
+        # to the following elements. This prevents a malformed element
+        # from eating into its neighbors.
+        if len(s) >= 2:
+            self._remaining = s[2 + s[1]:]
+            s = s[:2 + s[1]]
+        else:
+            self._remaining = b""
         # Backward compatibility: add info to all elements
         # This allows to introduce new Dot11Elt classes without breaking
         # previous code
@@ -1085,6 +1094,38 @@ class Dot11Elt(Packet):
             if length > 0 and length <= 255:
                 self.info = s[2:2 + length]
         return s
+
+    def do_dissect(self, s):
+        if type(self) is not Dot11Elt:
+            # The structure of a specific element must exactly match the
+            # announced length. If it does not (too short or too long),
+            # fallback to the generic Dot11Elt and keep the raw bytes.
+            try:
+                remain = super(Dot11Elt, self).do_dissect(s)
+            except Exception as exn:
+                if conf.debug_dissector:
+                    raise
+                log_runtime.debug(
+                    "Dot11Elt: %s dissection failed (%r), fallback to "
+                    "the generic element",
+                    self.__class__.__name__, exn
+                )
+            else:
+                if remain == b"":
+                    return remain
+                log_runtime.debug(
+                    "Dot11Elt: %s does not match its announced length, "
+                    "fallback to the generic element",
+                    self.__class__.__name__
+                )
+            self.__class__ = Dot11Elt
+            self.name = self._name
+            self.init_fields(for_dissect_only=True)
+            self.fields.clear()
+        return super(Dot11Elt, self).do_dissect(s)
+
+    def extract_padding(self, s):
+        return self._remaining, s
 
     def post_build(self, p, pay):
         if self.len is None:

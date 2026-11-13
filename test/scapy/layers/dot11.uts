@@ -434,6 +434,72 @@ assert f.ASEL.Explicit_CSI_Feedback_Based_Transmit_ASEL
 assert not f.ASEL.Antenna_Selection
 assert f.ASEL == 63
 
+= Dot11Elt with malformed announced length
+# An element whose announced length does not match its structure must not
+# hide the following elements: it falls back to a generic Dot11Elt that
+# preserves the raw bytes, and the next elements are still dissected.
+# HT Capabilities with len 13 instead of 26, followed by SSID and RSN
+data = b'\x80\x00\x00\x00\xff\xff\xff\xff\xff\xff\x00\x11"3DU\x00\x11"3DU\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00d\x00\x00\x00-\r\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x08testssid0\x1a\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x02\xc0\x00\x00\x00\x00\x0f\xac\x06'
+pkt = Dot11(data)
+assert Dot11EltHTCapabilities not in pkt
+assert pkt[Dot11Elt].ID == 45
+assert pkt[Dot11Elt].len == 13
+assert pkt[Dot11Elt].info == b"\xff" * 13
+assert pkt[Dot11Elt::{"ID": 0}].info == b"testssid"
+assert Dot11EltRSN in pkt
+assert pkt[Dot11Beacon].network_stats() == {
+    "ssid": "testssid",
+    "crypto": {"WPA2/PSK"},
+}
+assert raw(pkt) == data
+
+= Dot11EltRSN with malformed announced length
+# RSN element with len 2, followed by SSID
+data = b'\x80\x00\x00\x00\xff\xff\xff\xff\xff\xff\x00\x11"3DU\x00\x11"3DU\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00d\x00\x00\x000\x02\x01\x00\x00\x08testssid'
+pkt = Dot11(data)
+assert Dot11EltRSN not in pkt
+assert pkt[Dot11Elt].ID == 48
+assert pkt[Dot11Elt].info == b"\x01\x00"
+assert pkt[Dot11Elt::{"ID": 0}].info == b"testssid"
+assert pkt[Dot11Beacon].network_stats() == {
+    "ssid": "testssid",
+    "crypto": {"OPN"},
+}
+assert raw(pkt) == data
+
+= Dot11EltOBSS with malformed announced length
+# OBSS Scan Parameters element with len 3 instead of 14, followed by SSID
+data = b'\x80\x00\x00\x00\xff\xff\xff\xff\xff\xff\x00\x11"3DU\x00\x11"3DU\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00d\x00\x00\x00J\x03\x01\x02\x03\x00\x08testssid'
+pkt = Dot11(data)
+assert Dot11EltOBSS not in pkt
+assert pkt[Dot11Elt].ID == 74
+assert pkt[Dot11Elt].info == b"\x01\x02\x03"
+assert pkt[Dot11Elt::{"ID": 0}].info == b"testssid"
+assert raw(pkt) == data
+
+= Dot11Elt with extra announced length
+# HT Capabilities with len 27 instead of 26, followed by SSID
+data = b'\x80\x00\x00\x00\xff\xff\xff\xff\xff\xff\x00\x11"3DU\x00\x11"3DU\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00d\x00\x00\x00-\x1b\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x08testssid'
+pkt = Dot11(data)
+assert Dot11EltHTCapabilities not in pkt
+assert pkt[Dot11Elt].ID == 45
+assert pkt[Dot11Elt].info == b"\xff" * 27
+assert pkt[Dot11Elt::{"ID": 0}].info == b"testssid"
+assert raw(pkt) == data
+
+= Dot11Elt with empty DSSSet and network_stats
+# DSSSet element with len 0: network_stats() must not raise
+data = b'\x80\x00\x00\x00\xff\xff\xff\xff\xff\xff\x00\x11"3DU\x00\x11"3DU\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00d\x00\x00\x00\x03\x00\x00\x08testssid'
+pkt = Dot11(data)
+assert pkt[Dot11Elt].ID == 3
+assert pkt[Dot11Elt].len == 0
+assert pkt[Dot11Elt::{"ID": 0}].info == b"testssid"
+assert pkt[Dot11Beacon].network_stats() == {
+    "ssid": "testssid",
+    "crypto": {"OPN"},
+}
+assert raw(pkt) == data
+
 = RadioTap - MCS weird padding
 f = RadioTap(b'\x00\x00,\x00K\x08\x1c\x00"b\x96\x03\x00\x00\x00\x00\x10\x00l\t\x80\x04\xb0\x00\x80\x04\x01\x00l\t\x01\x00\x1f\x08\x0c\x00\x94\x05\x00\x00\x04\x00\x00\x00\x88\x020\x00.\xdf\xc4J\xb0\xdc\xa0c\x91sf\xech\x05\xca?\xf4h@Y\x00\x00\xaa\xaa\x03\x00\x00\x00\x08\x00E\x00\x05\xdc \xcf@\x00\x80\x06P\xf0\xc0\xa8\x01\n\xc0\xa8\x01\x02\xdb\x8f\x13\x89\xfbv\xa3\xde\xf6\xd8L\xe8P\x10\xff\xfft\xdd\x00\x0023456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901O\xdc\x01x')
 assert f.knownMCS == 31
