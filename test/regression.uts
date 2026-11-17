@@ -2406,6 +2406,44 @@ pktpcapngdefaults = rdpcap(pcapngdefaults)
 assert pktpcapngdefaults[0].time == 1575115986.114775512
 assert Ether in pktpcapngdefaults[0]
 
+= Read a pcapng file with multiple sections
+# Interface indexes and tsresol are scoped to their own section: the
+# second section redefines interface 0 (Ethernet, if_tsresol=9).
+import struct
+
+def pcapng_block(btype, body):
+    blen = 12 + len(body)
+    return struct.pack("<II", btype, blen) + body + struct.pack("<I", blen)
+
+def pcapng_epb(intid, ts, pkt):
+    body = (struct.pack("<IIIII", intid, ts >> 32, ts & 0xffffffff,
+                        len(pkt), len(pkt)) + pkt)
+    body += b"\x00" * (-len(pkt) % 4)
+    return pcapng_block(6, body)
+
+shb = pcapng_block(0x0A0D0D0A,
+                   b"\x4d\x3c\x2b\x1a" + struct.pack("<HHq", 1, 0, -1))
+# Section 1: raw IP packets, default (microsecond) resolution
+ipkt = raw(IP(src="192.0.2.1", dst="198.51.100.2") / UDP())
+sec1 = (shb +
+        pcapng_block(1, struct.pack("<HHI", DLT_RAW, 0, 262144)) +
+        pcapng_epb(0, 1454163407666223, ipkt))
+# Section 2: Ethernet packets, nanosecond resolution (if_tsresol=9)
+epkt = raw(Ether(src="00:01:02:03:04:05", dst="06:07:08:09:0a:0b") /
+           IP(src="192.0.2.2", dst="198.51.100.3") / UDP())
+sec2 = (shb +
+        pcapng_block(1, struct.pack("<HHI", DLT_EN10MB, 0, 262144) +
+                     struct.pack("<HH", 9, 1) + b"\x09\x00\x00\x00" +
+                     struct.pack("<HH", 0, 0)) +
+        pcapng_epb(0, 1600000001123456789, epkt))
+pkts = rdpcap(BytesIO(sec1 + sec2))
+assert len(pkts) == 2
+assert IP in pkts[0] and Ether not in pkts[0]
+assert pkts[0].time == 1454163407.666223
+assert Ether in pkts[1]
+assert pkts[1][IP].src == "192.0.2.2"
+assert pkts[1].time == EDecimal("1600000001.123456789")
+
 = Read a pcapng with little-endian SHB
 pktcapng = sniff(offline=scapy_path("/test/pcaps/macos.pcapng.gz"))
 assert len(pktcapng) != 0
@@ -2488,6 +2526,48 @@ p.comments = [b"Hello!", b"Scapy!", b"Pcapng!"]
 wrpcapng(tmpfile, p)
 l = rdpcap(tmpfile)
 assert l[0].comments == p.comments
+
+= Write a pcapng with nanosecond and exact microsecond timestamps
+
+tmpfile = get_temp_file(autoext=".pcapng")
+p = Ether() / "Hello Scapy!!!"
+p.time = EDecimal("1575115986.114775512")
+wrpcapng(tmpfile, p)
+with open(tmpfile, "rb") as fd:
+    assert b"\x09\x00\x01\x00\x09" in fd.read()  # if_tsresol = 10^9
+
+l = rdpcap(tmpfile)
+assert l[0].time == EDecimal("1575115986.114775512")
+
+p.time = EDecimal("1111111111.111111")
+wrpcapng(tmpfile, p)
+with open(tmpfile, "rb") as fd:
+    assert b"\x09\x00\x01\x00" not in fd.read()  # default tsresol
+
+l = rdpcap(tmpfile)
+assert l[0].time == EDecimal("1111111111.111111")
+
+= Write a pcapng with mixed timestamp resolutions
+
+p1 = Ether() / "a"
+p1.time = EDecimal("1632568366.384185")
+p2 = Ether() / "b"
+p2.time = EDecimal("1575115986.114775512")
+p3 = Ether() / "c"
+p3.time = EDecimal("1575115986.114775512")
+p3.sniffed_on = "eth0"
+
+tmpfile = get_temp_file(autoext=".pcapng")
+wrpcapng(tmpfile, [p1, p2])
+l = rdpcap(tmpfile)
+assert l[0].time == EDecimal("1632568366.384185")
+assert l[1].time == EDecimal("1575115986.114775512")
+
+wrpcapng(tmpfile, [p1, p3])
+l = rdpcap(tmpfile)
+assert l[0].time == EDecimal("1632568366.384185")
+assert l[1].time == EDecimal("1575115986.114775512")
+assert l[1].sniffed_on == "eth0"
 
 = rdpcap on fifo
 ~ linux

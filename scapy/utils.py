@@ -1797,6 +1797,10 @@ class RawPcapNgReader(RawPcapReader):
                                   " options (too short)")
         self._read_block_tail(blocklen)
         self._read_options(options)
+        # A new section starts: interface and process information
+        # indexes are only valid within their own section.
+        self.interfaces = []
+        self.process_information = []
 
     def _read_packet(self, size=MTU):  # type: ignore
         # type: (int) -> Tuple[bytes, RawPcapNgReader.PacketMetadata]
@@ -2483,6 +2487,8 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         # A dict to keep if_name to IDB id mapping.
         # unknown if_name(None) id=0
         self.interfaces2id: Dict[Optional[bytes], int] = {None: 0}
+        # The timestamp resolution of each interface, by IDB id.
+        self.interfaces_tsresol: Dict[int, int] = {}
 
         # tcpdump only support little-endian in PCAPng files
         self.endian = "<"
@@ -2493,18 +2499,31 @@ class RawPcapNgWriter(GenericRawPcapWriter):
 
     def _get_time(self,
                   packet,  # type: Union[bytes, Packet]
-                  sec,  # type: Optional[float]
+                  sec,  # type: Any
                   usec  # type: Optional[int]
                   ):
-        # type: (...) -> Tuple[float, int]
+        # type: (...) -> Tuple[Any, int]
         if hasattr(packet, "time"):
             if sec is None:
-                sec = float(packet.time)
+                # Keep the timestamp as-is (usually an EDecimal) so that
+                # sub-microsecond precision is not lost through a float
+                # conversion.
+                sec = packet.time
 
         if usec is None:
             usec = 0
 
-        return sec, usec  # type: ignore
+        return sec, usec
+
+    @staticmethod
+    def _get_tsresol(timestamp):
+        # type: (Any) -> int
+        """Return the timestamp resolution (10**6 or 10**9) required to
+        store a timestamp without losing precision."""
+        if isinstance(timestamp, Decimal):
+            if timestamp * 1000000 != int(timestamp * 1000000):
+                return 1000000000
+        return 1000000
 
     def _add_padding(self, raw_data):
         # type: (bytes) -> bytes
@@ -2539,7 +2558,9 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         if not self.header_present:
             self.header_present = True
             self._write_block_shb()
-            self._write_block_idb(linktype=self.linktype)
+            tsresol = self._get_tsresol(getattr(pkt, "time", None))
+            self.interfaces_tsresol[0] = tsresol
+            self._write_block_idb(linktype=self.linktype, tsresol=tsresol)
 
     def _write_block_shb(self):
         # type: () -> None
@@ -2559,7 +2580,8 @@ class RawPcapNgWriter(GenericRawPcapWriter):
 
     def _write_block_idb(self,
                          linktype,  # type: int
-                         ifname=None  # type: Optional[bytes]
+                         ifname=None,  # type: Optional[bytes]
+                         tsresol=1000000  # type: int
                          ):
         # type: (...) -> None
 
@@ -2572,12 +2594,17 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         # SnapLen
         block_idb += struct.pack(self.endian + "I", 262144)
 
-        # if_name option
-        opts = None
+        opts = b""
         if ifname is not None:
-            opts = struct.pack(self.endian + "HH", 2, len(ifname))
+            # if_name option
+            opts += struct.pack(self.endian + "HH", 2, len(ifname))
             # Pad Option Value to 32 bits
             opts += self._add_padding(ifname)
+        if tsresol != 1000000:
+            # if_tsresol option (base 10)
+            opts += struct.pack(self.endian + "HH", 9, 1)
+            opts += self._add_padding(bytes([len("%d" % tsresol) - 1]))
+        if opts:
             opts += struct.pack(self.endian + "HH", 0, 0)
 
         self.f.write(self.build_block(block_type, block_idb, options=opts))
@@ -2597,16 +2624,24 @@ class RawPcapNgWriter(GenericRawPcapWriter):
     def _write_block_epb(self,
                          raw_pkt,  # type: bytes
                          ifid,  # type: int
-                         timestamp=None,  # type: Optional[Union[EDecimal, float]]  # noqa: E501
+                         timestamp=None,  # type: Optional[Union[Decimal, float]]  # noqa: E501
                          caplen=None,  # type: Optional[int]
                          orglen=None,  # type: Optional[int]
                          comments=None,  # type: Optional[List[bytes]]
                          flags=None,  # type: Optional[int]
+                         tsresol=None,  # type: Optional[int]
                          ):
         # type: (...) -> None
 
+        if tsresol is None:
+            tsresol = self.tsresol
+
         if timestamp:
-            tmp_ts = int(timestamp * self.tsresol)
+            if isinstance(timestamp, float):
+                # Use the decimal representation of the float to avoid
+                # binary floating point rounding errors.
+                timestamp = Decimal(str(timestamp))
+            tmp_ts = int(timestamp * tsresol)
             ts_high = tmp_ts >> 32
             ts_low = tmp_ts & 0xFFFFFFFF
         else:
@@ -2701,11 +2736,18 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         if wirelen is None:
             wirelen = caplen
 
+        tsresol = self._get_tsresol(sec)
         ifid = self.interfaces2id.get(ifname, None)
-        if ifid is None:
+        if ifid is None or \
+                tsresol > self.interfaces_tsresol.get(ifid, 1000000):
+            # Declare a new interface, either because this ifname is
+            # unknown or because it was declared with a timestamp
+            # resolution too low for this packet.
             ifid = max(self.interfaces2id.values()) + 1
             self.interfaces2id[ifname] = ifid
-            self._write_block_idb(linktype=linktype, ifname=ifname)
+            self.interfaces_tsresol[ifid] = tsresol
+            self._write_block_idb(linktype=linktype, ifname=ifname,
+                                  tsresol=tsresol)
 
         # EPB flags (32 bits).
         # currently only direction is implemented (least 2 significant bits)
@@ -2715,7 +2757,10 @@ class RawPcapNgWriter(GenericRawPcapWriter):
             flags = None
 
         self._write_block_epb(packet, timestamp=sec, caplen=caplen,
-                              orglen=wirelen, comments=comments, ifid=ifid, flags=flags)
+                              orglen=wirelen, comments=comments, ifid=ifid,
+                              flags=flags,
+                              tsresol=self.interfaces_tsresol.get(
+                                  ifid, self.tsresol))
         if self.sync:
             self.f.flush()
 
@@ -2727,21 +2772,7 @@ class PcapWriter(RawPcapWriter):
 
 class PcapNgWriter(RawPcapNgWriter):
     """A stream pcapng writer with more control than wrpcapng()"""
-
-    def _get_time(self,
-                  packet,  # type: Union[bytes, Packet]
-                  sec,  # type: Optional[float]
-                  usec  # type: Optional[int]
-                  ):
-        # type: (...) -> Tuple[float, int]
-        if hasattr(packet, "time"):
-            if sec is None:
-                sec = float(packet.time)
-
-        if usec is None:
-            usec = 0
-
-        return sec, usec  # type: ignore
+    pass
 
 
 @conf.commands.register
